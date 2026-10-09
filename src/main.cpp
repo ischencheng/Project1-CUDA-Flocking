@@ -34,7 +34,8 @@ const float DT = 0.2f;
 //   cis5650_boids.exe -n 20000 -mode scattered -block 256 -cell 1 -novis -time 10
 // "-time T" prints the average fps over T seconds and then exits.
 bool visualize = VISUALIZE;
-int simMode = UNIFORM_GRID ? (COHERENT_GRID ? 2 : 1) : 0; // 0 naive, 1 scattered, 2 coherent
+// 0 naive, 1 scattered, 2 coherent, 3 coherent with shared memory ("-mode shared")
+int simMode = UNIFORM_GRID ? (COHERENT_GRID ? 2 : 1) : 0;
 int cudaBlockSize = 128;
 float cellScale = 2.0f;
 double benchSeconds = 0.0;
@@ -49,7 +50,7 @@ void parseArgs(int argc, char **argv) {
       N_FOR_VIS = std::atoi(argv[++i]);
     } else if (arg == "-mode" && hasValue) {
       std::string mode = argv[++i];
-      simMode = mode == "naive" ? 0 : (mode == "scattered" ? 1 : 2);
+      simMode = mode == "naive" ? 0 : mode == "scattered" ? 1 : mode == "shared" ? 3 : 2;
     } else if (arg == "-block" && hasValue) {
       cudaBlockSize = std::atoi(argv[++i]);
     } else if (arg == "-cell" && hasValue) {
@@ -238,7 +239,9 @@ void initShaders(GLuint * program) {
     cudaGLMapBufferObject((void**)&dptrVertVelocities, boidVBO_velocities);
 
     // execute the kernel
-    if (simMode == 2) {
+    if (simMode == 3) {
+      Boids::stepSimulationSharedGrid(DT);
+    } else if (simMode == 2) {
       Boids::stepSimulationCoherentGrid(DT);
     } else if (simMode == 1) {
       Boids::stepSimulationScatteredGrid(DT);

@@ -4,6 +4,7 @@
 #include "kernel.h"
 #include "utilityCore.hpp"
 
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <iostream>
@@ -13,6 +14,8 @@
 #include <thrust/execution_policy.h>
 #include <thrust/random.h>
 #include <thrust/device_vector.h>
+#include <thrust/binary_search.h>
+#include <thrust/iterator/counting_iterator.h>
 
 #include <glm/glm.hpp>
 
@@ -550,6 +553,103 @@ __global__ void kernReshuffle(int N, int *particleArrayIndices,
   velSorted[index] = vel[src];
 }
 
+// Extra credit: shared memory. Works on the coherent data like
+// kernUpdateVelNeighborSearchCoherent. The boids of one block are next to each
+// other in the sorted order, so they need almost the same neighbor cells. The
+// block goes over its neighbor cells one row (along x) at a time, loads the
+// boids of the row into shared memory together, and every thread reads its own
+// neighbors from there. Every cell needs a [start, end) range here, also the
+// empty ones, so that a row of cells is one range of boids.
+__global__ void kernUpdateVelNeighborSearchShared(
+  int N, int gridResolution, glm::vec3 gridMin, float inverseCellWidth,
+  int *gridCellStartIndices, int *gridCellEndIndices,
+  glm::vec3 *pos, glm::vec3 *vel1, glm::vec3 *vel2) {
+  // blockDim.x positions, then blockDim.x velocities. float4 instead of vec3,
+  // so one boid is a single 16 byte read.
+  extern __shared__ float4 tile[];
+  float4 *tilePos = tile;
+  float4 *tileVel = tile + blockDim.x;
+  __shared__ int blockMin[3], blockMax[3], rowStart, rowEnd;
+
+  int index = threadIdx.x + (blockIdx.x * blockDim.x);
+  // threads past N have no boid, but they still help to load the tiles
+  bool active = index < N;
+  glm::vec3 selfPos(0.0f);
+  glm::ivec3 minCell, maxCell;
+  if (active) {
+    selfPos = pos[index];
+    findNeighborCells(selfPos, gridMin, inverseCellWidth, gridResolution, minCell, maxCell);
+  }
+
+  // box of cells that covers the neighbor cells of all boids in the block
+  if (threadIdx.x == 0) {
+    for (int k = 0; k < 3; k++) {
+      blockMin[k] = INT_MAX;
+      blockMax[k] = -1;
+    }
+  }
+  __syncthreads();
+  if (active) {
+    for (int k = 0; k < 3; k++) {
+      atomicMin(&blockMin[k], minCell[k]);
+      atomicMax(&blockMax[k], maxCell[k]);
+    }
+  }
+  __syncthreads();
+
+  RuleSums sums;
+  for (int z = blockMin[2]; z <= blockMax[2]; z++) {
+    for (int y = blockMin[1]; y <= blockMax[1]; y++) {
+      // the boids this thread needs from this row
+      int myStart = INT_MAX, myEnd = -1;
+      if (active && y >= minCell.y && y <= maxCell.y && z >= minCell.z && z <= maxCell.z) {
+        myStart = gridCellStartIndices[gridIndex3Dto1D(minCell.x, y, z, gridResolution)];
+        myEnd = gridCellEndIndices[gridIndex3Dto1D(maxCell.x, y, z, gridResolution)];
+      }
+      // the part of the row that any thread of the block needs
+      if (threadIdx.x == 0) {
+        rowStart = INT_MAX;
+        rowEnd = -1;
+      }
+      __syncthreads();
+      if (myStart < myEnd) {
+        atomicMin(&rowStart, myStart);
+        atomicMax(&rowEnd, myEnd);
+      }
+      __syncthreads();
+      int start = rowStart, end = rowEnd;
+      if (start >= end) {
+        // nobody needs this row. Still sync, so thread 0 doesn't reset rowStart
+        // for the next row while other threads are reading it.
+        __syncthreads();
+        continue;
+      }
+
+      for (int tileStart = start; tileStart < end; tileStart += blockDim.x) {
+        int j = tileStart + threadIdx.x;
+        if (j < end) {
+          glm::vec3 p = pos[j], v = vel1[j];
+          tilePos[threadIdx.x] = make_float4(p.x, p.y, p.z, 0.0f);
+          tileVel[threadIdx.x] = make_float4(v.x, v.y, v.z, 0.0f);
+        }
+        __syncthreads();
+        int from = imax(myStart, tileStart);
+        int to = imin(myEnd, tileStart + (int)blockDim.x);
+        for (int i = from; i < to; i++) {
+          if (i != index) {
+            float4 p = tilePos[i - tileStart], v = tileVel[i - tileStart];
+            addNeighbor(sums, selfPos, glm::vec3(p.x, p.y, p.z), glm::vec3(v.x, v.y, v.z));
+          }
+        }
+        __syncthreads();
+      }
+    }
+  }
+  if (active) {
+    vel2[index] = clampSpeed(vel1[index] + rulesToVelocityChange(sums, selfPos));
+  }
+}
+
 /**
 * Step the entire N-body simulation by `dt` seconds.
 */
@@ -568,8 +668,9 @@ void Boids::stepSimulationNaive(float dt) {
 }
 
 // Label the boids with their cells, sort them by cell and find where each
-// cell starts and ends in the sorted array
-void buildUniformGrid() {
+// cell starts and ends in the sorted array. With fillEmptyCells, an empty cell
+// gets start = end = the place where its boids would be, instead of -1.
+void buildUniformGrid(bool fillEmptyCells = false) {
   dim3 fullBlocksPerGrid((numObjects + blockSize - 1) / blockSize);
   dim3 cellBlocksPerGrid((gridCellCount + blockSize - 1) / blockSize);
 
@@ -579,6 +680,16 @@ void buildUniformGrid() {
 
   thrust::sort_by_key(dev_thrust_particleGridIndices, dev_thrust_particleGridIndices + numObjects,
     dev_thrust_particleArrayIndices);
+
+  if (fillEmptyCells) {
+    // binary search every cell index in the sorted cell indices
+    thrust::counting_iterator<int> cells(0);
+    thrust::lower_bound(dev_thrust_particleGridIndices, dev_thrust_particleGridIndices + numObjects,
+      cells, cells + gridCellCount, thrust::device_ptr<int>(dev_gridCellStartIndices));
+    thrust::upper_bound(dev_thrust_particleGridIndices, dev_thrust_particleGridIndices + numObjects,
+      cells, cells + gridCellCount, thrust::device_ptr<int>(dev_gridCellEndIndices));
+    return;
+  }
 
   // -1 marks an empty cell
   kernResetIntBuffer<<<cellBlocksPerGrid, blockSize>>>(gridCellCount, dev_gridCellStartIndices, -1);
@@ -653,6 +764,29 @@ void Boids::stepSimulationCoherentGrid(float dt) {
   // - Ping-pong buffers as needed. THIS MAY BE DIFFERENT FROM BEFORE.
   // vel1 already has the new velocities, only the positions need to swap.
   // The boids just stay in the sorted order for the next step.
+  std::swap(dev_pos, dev_pos2);
+}
+
+// Same as the coherent grid, except for the cell ranges and the velocity kernel
+void Boids::stepSimulationSharedGrid(float dt) {
+  buildUniformGrid(true);
+
+  dim3 fullBlocksPerGrid((numObjects + blockSize - 1) / blockSize);
+  kernReshuffle<<<fullBlocksPerGrid, blockSize>>>(numObjects, dev_particleArrayIndices,
+    dev_pos, dev_vel1, dev_pos2, dev_vel2);
+  checkCUDAErrorWithLine("kernReshuffle failed!");
+
+  // shared memory for blockSize positions and blockSize velocities
+  int sharedBytes = 2 * blockSize * sizeof(float4);
+  kernUpdateVelNeighborSearchShared<<<fullBlocksPerGrid, blockSize, sharedBytes>>>(numObjects,
+    gridSideCount, gridMinimum, gridInverseCellWidth,
+    dev_gridCellStartIndices, dev_gridCellEndIndices,
+    dev_pos2, dev_vel2, dev_vel1);
+  checkCUDAErrorWithLine("kernUpdateVelNeighborSearchShared failed!");
+
+  kernUpdatePos<<<fullBlocksPerGrid, blockSize>>>(numObjects, dt, dev_pos2, dev_vel1);
+  checkCUDAErrorWithLine("kernUpdatePos failed!");
+
   std::swap(dev_pos, dev_pos2);
 }
 
