@@ -34,6 +34,10 @@ shows the velocity of each boid. The gif shows one frame every 15 simulation ste
   `pos + R` and loops over that range. A cell whose closest point is farther
   than R is skipped, because none of its boids can be a neighbor. This works for
   any cell width, not only R and 2R.
+* **Extra credit, shared memory:** a fourth version (`-mode shared`) on top of
+  the coherent grid. The boids of one block load their neighbor cells into
+  shared memory together and then read their neighbors from there. See the last
+  section.
 
 I also added some command line options, so I don't have to recompile for every test:
 
@@ -41,7 +45,7 @@ I also added some command line options, so I don't have to recompile for every t
 cis5650_boids.exe -n 20000 -mode coherent -block 128 -cell 2 -novis -time 5
 ```
 
-`-mode` is `naive`, `scattered` or `coherent`, `-cell` is the cell width in
+`-mode` is `naive`, `scattered`, `coherent` or `shared`, `-cell` is the cell width in
 units of R and `-novis` turns off drawing. With `-time 5` the program runs for 5
 seconds after 1 second of warm up, prints the average fps and exits. The window
 title also shows the average fps. I turned off v-sync in the code with
@@ -174,3 +178,43 @@ R is the best width. With 0.5R a boid visits up to 5×5×5 = 125 small cells, an
 there the skip test even makes it slower. With 3R the searched box is big again.
 1.5R is a bit slower than 2R. I think this is because with 1.5R some boids loop
 over 2 cells on an axis and some over 3, so the threads of a warp diverge.
+
+### Extra Credit: Shared Memory
+
+The boids of one block are next to each other in the sorted order, so they are
+also close in space and need almost the same neighbor cells. The shared version
+goes over these cells one row (along x) at a time. Since the boids are sorted by
+cell, a row of cells is one range of boids. For that, empty cells also need a
+start and end, which I get with `thrust::lower_bound` and `thrust::upper_bound`
+on the sorted cell indices. For each row, the block finds the part that any of
+its threads needs (with `atomicMin`/`atomicMax` in shared memory) and loads it
+into shared memory, `blockSize` boids at a time. Then every thread checks its
+own neighbors in that tile. I store each boid as a `float4` in shared memory, so
+a neighbor is one 16-byte read instead of three 4-byte reads.
+
+![coherent vs shared memory](images/fps_shared.png)
+
+| boids | coherent, R | shared, R | coherent, 2R | shared, 2R |
+| --- | --- | --- | --- | --- |
+| 20,000 | 1879 | 1719 | 1853 | 1713 |
+| 100,000 | 1067 | 1119 | 804 | 644 |
+| 500,000 | 201 | 219 | 96 | 71 |
+| 1,000,000 | 72 | 81 | 28 | 20 |
+
+With cell width R, shared memory is faster from about 100,000 boids on, and 12%
+faster at 1,000,000 boids (13% with block size 256: 81.8 vs 72.3 fps). That makes
+it the fastest version for large flocks. With cell width 2R it is 20-28% slower
+for 100,000 boids and more.
+
+The difference comes from which cells the boids need. With width R every boid
+checks the 3×3×3 cells around its own cell, so all boids in a cell need exactly
+the same rows and the block works on them together. With width 2R every boid
+picks the 2 cells on its side on each axis, so boids in the same block need
+different rows. The block still has to go through every row that any of them
+needs, and the threads that don't need a row just wait at `__syncthreads()`.
+For small flocks shared memory is slower too, because the cells are almost
+empty and the extra syncs and atomics cost more than they save.
+
+I expected a bigger gain. I think the coherent version already gets most of its
+reads from the L1 cache, and on this GPU the L1 cache and shared memory are the
+same hardware, so shared memory mostly saves some load instructions.
