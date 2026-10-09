@@ -23,18 +23,48 @@
 
 // LOOK-2.1 LOOK-2.3 - toggles for UNIFORM_GRID and COHERENT_GRID
 #define VISUALIZE 1
-#define UNIFORM_GRID 0
-#define COHERENT_GRID 0
+#define UNIFORM_GRID 1
+#define COHERENT_GRID 1
 
 // LOOK-1.2 - change this to adjust particle count in the simulation
-const int N_FOR_VIS = 5000;
+int N_FOR_VIS = 5000;
 const float DT = 0.2f;
+
+// command line options, e.g. -n 20000 -mode shared -block 256 -cell 1 -novis -time 10
+bool visualize = VISUALIZE;
+// 0 naive, 1 scattered, 2 coherent, 3 shared
+int simMode = UNIFORM_GRID ? (COHERENT_GRID ? 2 : 1) : 0;
+int cudaBlockSize = 128;
+float cellScale = 2.0f;
+double benchSeconds = 0.0;
+
+void parseArgs(int argc, char **argv) {
+  for (int i = 1; i < argc; i++) {
+    std::string arg = argv[i];
+    bool hasValue = i + 1 < argc;
+    if (arg == "-novis") {
+      visualize = false;
+    } else if (arg == "-n" && hasValue) {
+      N_FOR_VIS = std::atoi(argv[++i]);
+    } else if (arg == "-mode" && hasValue) {
+      std::string mode = argv[++i];
+      simMode = mode == "naive" ? 0 : mode == "scattered" ? 1 : mode == "shared" ? 3 : 2;
+    } else if (arg == "-block" && hasValue) {
+      cudaBlockSize = std::atoi(argv[++i]);
+    } else if (arg == "-cell" && hasValue) {
+      cellScale = (float)std::atof(argv[++i]);
+    } else if (arg == "-time" && hasValue) {
+      benchSeconds = std::atof(argv[++i]);
+    }
+  }
+}
 
 /**
 * C main function.
 */
 int main(int argc, char* argv[]) {
   projectName = "5650 CUDA Intro: Boids";
+  parseArgs(argc, argv);
 
   if (init(argc, argv)) {
     mainLoop();
@@ -98,6 +128,8 @@ bool init(int argc, char **argv) {
     return false;
   }
   glfwMakeContextCurrent(window);
+  // turn off v-sync
+  glfwSwapInterval(0);
   glfwSetKeyCallback(window, keyCallback);
   glfwSetCursorPosCallback(window, mousePositionCallback);
   glfwSetMouseButtonCallback(window, mouseButtonCallback);
@@ -118,7 +150,7 @@ bool init(int argc, char **argv) {
   cudaGLRegisterBufferObject(boidVBO_velocities);
 
   // Initialize N-body simulation
-  Boids::initSimulation(N_FOR_VIS);
+  Boids::initSimulation(N_FOR_VIS, cudaBlockSize, cellScale);
 
   updateCamera();
 
@@ -205,17 +237,19 @@ void initShaders(GLuint * program) {
     cudaGLMapBufferObject((void**)&dptrVertVelocities, boidVBO_velocities);
 
     // execute the kernel
-    #if UNIFORM_GRID && COHERENT_GRID
-    Boids::stepSimulationCoherentGrid(DT);
-    #elif UNIFORM_GRID
-    Boids::stepSimulationScatteredGrid(DT);
-    #else
-    Boids::stepSimulationNaive(DT);
-    #endif
+    if (simMode == 3) {
+      Boids::stepSimulationSharedGrid(DT);
+    } else if (simMode == 2) {
+      Boids::stepSimulationCoherentGrid(DT);
+    } else if (simMode == 1) {
+      Boids::stepSimulationScatteredGrid(DT);
+    } else {
+      Boids::stepSimulationNaive(DT);
+    }
 
-    #if VISUALIZE
-    Boids::copyBoidsToVBO(dptrVertPositions, dptrVertVelocities);
-    #endif
+    if (visualize) {
+      Boids::copyBoidsToVBO(dptrVertPositions, dptrVertVelocities);
+    }
     // unmap buffer object
     cudaGLUnmapBufferObject(boidVBO_positions);
     cudaGLUnmapBufferObject(boidVBO_velocities);
@@ -229,6 +263,11 @@ void initShaders(GLuint * program) {
     Boids::unitTest(); // LOOK-1.2 We run some basic example code to make sure
                        // your CUDA development setup is ready to go.
 
+    // average fps, skip the first second
+    double avgStart = glfwGetTime() + 1.0;
+    int avgFrames = 0;
+    double avgFps = 0;
+
     while (!glfwWindowShouldClose(window)) {
       glfwPollEvents();
 
@@ -240,6 +279,14 @@ void initShaders(GLuint * program) {
         timebase = time;
         frame = 0;
       }
+      if (time > avgStart) {
+        avgFrames++;
+        avgFps = avgFrames / (time - avgStart);
+      }
+      if (benchSeconds > 0 && time > avgStart + benchSeconds) {
+        std::cout << "avg fps: " << avgFps << std::endl;
+        glfwSetWindowShouldClose(window, GL_TRUE);
+      }
 
       runCUDA();
 
@@ -247,23 +294,23 @@ void initShaders(GLuint * program) {
       ss << "[";
       ss.precision(1);
       ss << std::fixed << fps;
-      ss << " fps] " << deviceName;
+      ss << " fps, avg " << avgFps << "] " << deviceName;
       glfwSetWindowTitle(window, ss.str().c_str());
 
       glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-      #if VISUALIZE
-      glUseProgram(program[PROG_BOID]);
-      glBindVertexArray(boidVAO);
-      glPointSize((GLfloat)pointSize);
-      glDrawElements(GL_POINTS, N_FOR_VIS + 1, GL_UNSIGNED_INT, 0);
-      glPointSize(1.0f);
+      if (visualize) {
+        glUseProgram(program[PROG_BOID]);
+        glBindVertexArray(boidVAO);
+        glPointSize((GLfloat)pointSize);
+        glDrawElements(GL_POINTS, N_FOR_VIS + 1, GL_UNSIGNED_INT, 0);
+        glPointSize(1.0f);
 
-      glUseProgram(0);
-      glBindVertexArray(0);
+        glUseProgram(0);
+        glBindVertexArray(0);
 
-      glfwSwapBuffers(window);
-      #endif
+        glfwSwapBuffers(window);
+      }
     }
     glfwDestroyWindow(window);
     glfwTerminate();
