@@ -61,6 +61,10 @@ void checkCUDAError(const char *msg, int line = -1) {
 
 #define maxSpeed 1.0f
 
+// Grid cell width in units of the max rule distance.
+// 2 -> each boid checks 8 cells, 1 -> each boid checks 27 cells
+#define cellWidthScale 2.0f
+
 /*! Size of the starting area in simulation space. */
 #define scene_scale 100.0f
 
@@ -174,7 +178,7 @@ void Boids::initSimulation(int N) {
   checkCUDAErrorWithLine("kernGenerateRandomPosArray failed!");
 
   // LOOK-2.1 computing grid params
-  gridCellWidth = 2.0f * std::max(std::max(rule1Distance, rule2Distance), rule3Distance);
+  gridCellWidth = cellWidthScale * std::max(std::max(rule1Distance, rule2Distance), rule3Distance);
   int halfSideCount = (int)(scene_scale / gridCellWidth) + 1;
   gridSideCount = 2 * halfSideCount;
 
@@ -371,7 +375,8 @@ __device__ int gridIndex3Dto1D(int x, int y, int z, int gridResolution) {
 }
 
 // Range of cells (inclusive) that overlap the box of size 2 * maxDistance
-// around the boid. With cell width = 2 * maxDistance this is 2x2x2 = 8 cells.
+// around the boid. With cell width = 2 * maxDistance this is 2x2x2 = 8 cells,
+// with cell width = maxDistance it is 3x3x3 = 27 cells.
 __device__ void findNeighborCells(glm::vec3 pos, glm::vec3 gridMin,
   float inverseCellWidth, int gridResolution, glm::ivec3 &minCell, glm::ivec3 &maxCell) {
   float maxDistance = imax(imax(rule1Distance, rule2Distance), rule3Distance);
