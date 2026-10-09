@@ -46,8 +46,8 @@ void checkCUDAError(const char *msg, int line = -1) {
 * Configuration *
 *****************/
 
-/*! Block size used for CUDA kernel launch. */
-#define blockSize 128
+/*! Block size used for CUDA kernel launch. Set in Boids::initSimulation. */
+int blockSize = 128;
 
 // LOOK-1.2 Parameters for the boids algorithm.
 // These worked well in our reference implementation.
@@ -61,9 +61,9 @@ void checkCUDAError(const char *msg, int line = -1) {
 
 #define maxSpeed 1.0f
 
-// Grid cell width in units of the max rule distance.
+// Grid cell width in units of the max rule distance. Set in Boids::initSimulation.
 // 2 -> each boid checks 8 cells, 1 -> each boid checks 27 cells
-#define cellWidthScale 2.0f
+float cellWidthScale = 2.0f;
 
 /*! Size of the starting area in simulation space. */
 #define scene_scale 100.0f
@@ -153,8 +153,10 @@ __global__ void kernGenerateRandomPosArray(int time, int N, glm::vec3 * arr, flo
 /**
 * Initialize memory, update some globals
 */
-void Boids::initSimulation(int N) {
+void Boids::initSimulation(int N, int blockSize, float cellWidthScale) {
   numObjects = N;
+  ::blockSize = blockSize;
+  ::cellWidthScale = cellWidthScale;
   dim3 fullBlocksPerGrid((N + blockSize - 1) / blockSize);
 
   // LOOK-1.2 - This is basic CUDA memory management and error checking.
