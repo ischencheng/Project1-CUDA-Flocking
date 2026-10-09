@@ -394,6 +394,16 @@ __device__ void findNeighborCells(glm::vec3 pos, glm::vec3 gridMin,
   maxCell = glm::clamp(maxCell, 0, gridResolution - 1);
 }
 
+// Grid-looping: does any part of cell (x, y, z) lie within maxDistance of the
+// boid? The corner cells of the range above often don't, so we can skip them.
+__device__ bool cellTouchesNeighborhood(glm::vec3 pos, glm::vec3 gridMin,
+  float cellWidth, int x, int y, int z) {
+  float maxDistance = imax(imax(rule1Distance, rule2Distance), rule3Distance);
+  glm::vec3 cellMin = gridMin + glm::vec3(x, y, z) * cellWidth;
+  glm::vec3 closest = glm::clamp(pos, cellMin, cellMin + cellWidth);
+  return glm::distance(closest, pos) <= maxDistance;
+}
+
 __global__ void kernComputeIndices(int N, int gridResolution,
   glm::vec3 gridMin, float inverseCellWidth,
   glm::vec3 *pos, int *indices, int *gridIndices) {
@@ -465,6 +475,9 @@ __global__ void kernUpdateVelNeighborSearchScattered(
   for (int z = minCell.z; z <= maxCell.z; z++) {
     for (int y = minCell.y; y <= maxCell.y; y++) {
       for (int x = minCell.x; x <= maxCell.x; x++) {
+        if (!cellTouchesNeighborhood(selfPos, gridMin, cellWidth, x, y, z)) {
+          continue;
+        }
         int cell = gridIndex3Dto1D(x, y, z, gridResolution);
         // empty cells have start = end = -1, so the loop is skipped
         for (int i = gridCellStartIndices[cell]; i < gridCellEndIndices[cell]; i++) {
@@ -510,6 +523,9 @@ __global__ void kernUpdateVelNeighborSearchCoherent(
   for (int z = minCell.z; z <= maxCell.z; z++) {
     for (int y = minCell.y; y <= maxCell.y; y++) {
       for (int x = minCell.x; x <= maxCell.x; x++) {
+        if (!cellTouchesNeighborhood(selfPos, gridMin, cellWidth, x, y, z)) {
+          continue;
+        }
         int cell = gridIndex3Dto1D(x, y, z, gridResolution);
         for (int i = gridCellStartIndices[cell]; i < gridCellEndIndices[cell]; i++) {
           if (i != index) {
