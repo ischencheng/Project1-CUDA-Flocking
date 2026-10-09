@@ -49,7 +49,7 @@ void checkCUDAError(const char *msg, int line = -1) {
 * Configuration *
 *****************/
 
-/*! Block size used for CUDA kernel launch. Set in Boids::initSimulation. */
+/*! Block size used for CUDA kernel launch. */
 int blockSize = 128;
 
 // LOOK-1.2 Parameters for the boids algorithm.
@@ -64,8 +64,7 @@ int blockSize = 128;
 
 #define maxSpeed 1.0f
 
-// Grid cell width in units of the max rule distance. Set in Boids::initSimulation.
-// 2 -> each boid checks 8 cells, 1 -> each boid checks 27 cells
+// cell width / max rule distance (2 -> 8 cells, 1 -> 27 cells)
 float cellWidthScale = 2.0f;
 
 /*! Size of the starting area in simulation space. */
@@ -102,8 +101,7 @@ int *dev_gridCellEndIndices;   // to this cell?
 
 // TODO-2.3 - consider what additional buffers you might need to reshuffle
 // the position and velocity data to be coherent within cells.
-// Positions are reshuffled into dev_pos2. Velocities are reshuffled into
-// dev_vel2, because the unsorted vel1 is not needed after that.
+// sorted positions (sorted velocities reuse dev_vel2)
 glm::vec3 *dev_pos2;
 
 // LOOK-2.1 - Grid parameters based on simulation parameters.
@@ -270,7 +268,7 @@ void Boids::copyBoidsToVBO(float *vbodptr_positions, float *vbodptr_velocities) 
 * stepSimulation *
 ******************/
 
-// Sums of the three rules over all neighbors of one boid
+// sums of the three rules over the neighbors of one boid
 struct RuleSums {
   glm::vec3 center = glm::vec3(0.0f);
   glm::vec3 separate = glm::vec3(0.0f);
@@ -279,7 +277,7 @@ struct RuleSums {
   int count3 = 0;
 };
 
-// Add another boid (not itself) to the rule sums if it is close enough
+// add one neighbor to the rule sums
 __device__ void addNeighbor(RuleSums &sums, glm::vec3 selfPos,
   glm::vec3 otherPos, glm::vec3 otherVel) {
   float dist = glm::distance(otherPos, selfPos);
@@ -346,7 +344,7 @@ __global__ void kernUpdateVelocityBruteForce(int N, glm::vec3 *pos,
   glm::vec3 newVel = vel1[index] + computeVelocityChange(N, index, pos, vel1);
   // Clamp the speed
   // Record the new velocity into vel2. Question: why NOT vel1?
-  // Other threads may still be reading vel1 of this boid for their own update.
+  // other threads may still be reading vel1
   vel2[index] = clampSpeed(newVel);
 }
 
@@ -385,9 +383,7 @@ __device__ int gridIndex3Dto1D(int x, int y, int z, int gridResolution) {
   return x + y * gridResolution + z * gridResolution * gridResolution;
 }
 
-// Range of cells (inclusive) that overlap the box of size 2 * maxDistance
-// around the boid. With cell width = 2 * maxDistance this is 2x2x2 = 8 cells,
-// with cell width = maxDistance it is 3x3x3 = 27 cells.
+// range of cells that can have neighbors (8 cells for width 2R, 27 for R)
 __device__ void findNeighborCells(glm::vec3 pos, glm::vec3 gridMin,
   float inverseCellWidth, int gridResolution, glm::ivec3 &minCell, glm::ivec3 &maxCell) {
   float maxDistance = imax(imax(rule1Distance, rule2Distance), rule3Distance);
@@ -397,8 +393,7 @@ __device__ void findNeighborCells(glm::vec3 pos, glm::vec3 gridMin,
   maxCell = glm::clamp(maxCell, 0, gridResolution - 1);
 }
 
-// Grid-looping: does any part of cell (x, y, z) lie within maxDistance of the
-// boid? The corner cells of the range above often don't, so we can skip them.
+// grid-looping: skip cells that are farther than maxDistance
 __device__ bool cellTouchesNeighborhood(glm::vec3 pos, glm::vec3 gridMin,
   float cellWidth, int x, int y, int z) {
   float maxDistance = imax(imax(rule1Distance, rule2Distance), rule3Distance);
@@ -446,7 +441,7 @@ __global__ void kernIdentifyCellStartEnd(int N, int *particleGridIndices,
   if (index == 0 || particleGridIndices[index - 1] != cell) {
     gridCellStartIndices[cell] = index;
   }
-  // end is exclusive, so the boids of a cell are [start, end)
+  // end is exclusive
   if (index == N - 1 || particleGridIndices[index + 1] != cell) {
     gridCellEndIndices[cell] = index + 1;
   }
@@ -482,7 +477,7 @@ __global__ void kernUpdateVelNeighborSearchScattered(
           continue;
         }
         int cell = gridIndex3Dto1D(x, y, z, gridResolution);
-        // empty cells have start = end = -1, so the loop is skipped
+        // empty cells are -1, -1
         for (int i = gridCellStartIndices[cell]; i < gridCellEndIndices[cell]; i++) {
           int other = particleArrayIndices[i];
           if (other != index) {
@@ -521,8 +516,7 @@ __global__ void kernUpdateVelNeighborSearchCoherent(
   findNeighborCells(selfPos, gridMin, inverseCellWidth, gridResolution, minCell, maxCell);
 
   RuleSums sums;
-  // x changes fastest in gridIndex3Dto1D, so x is the inner loop. Then the
-  // cells we read one after another are also next to each other in memory.
+  // x is the inner loop, so the cells are read in memory order
   for (int z = minCell.z; z <= maxCell.z; z++) {
     for (int y = minCell.y; y <= maxCell.y; y++) {
       for (int x = minCell.x; x <= maxCell.x; x++) {
@@ -541,7 +535,7 @@ __global__ void kernUpdateVelNeighborSearchCoherent(
   vel2[index] = clampSpeed(vel1[index] + rulesToVelocityChange(sums, selfPos));
 }
 
-// Gather pos and vel into the sorted cell order
+// reorder pos and vel by cell
 __global__ void kernReshuffle(int N, int *particleArrayIndices,
   glm::vec3 *pos, glm::vec3 *vel, glm::vec3 *posSorted, glm::vec3 *velSorted) {
   int index = threadIdx.x + (blockIdx.x * blockDim.x);
@@ -553,26 +547,20 @@ __global__ void kernReshuffle(int N, int *particleArrayIndices,
   velSorted[index] = vel[src];
 }
 
-// Extra credit: shared memory. Works on the coherent data like
-// kernUpdateVelNeighborSearchCoherent. The boids of one block are next to each
-// other in the sorted order, so they need almost the same neighbor cells. The
-// block goes over its neighbor cells one row (along x) at a time, loads the
-// boids of the row into shared memory together, and every thread reads its own
-// neighbors from there. Every cell needs a [start, end) range here, also the
-// empty ones, so that a row of cells is one range of boids.
+// extra credit: shared memory version of kernUpdateVelNeighborSearchCoherent
+// the block loads its neighbor cells one row of cells at a time
 __global__ void kernUpdateVelNeighborSearchShared(
   int N, int gridResolution, glm::vec3 gridMin, float inverseCellWidth,
   int *gridCellStartIndices, int *gridCellEndIndices,
   glm::vec3 *pos, glm::vec3 *vel1, glm::vec3 *vel2) {
-  // blockDim.x positions, then blockDim.x velocities. float4 instead of vec3,
-  // so one boid is a single 16 byte read.
+  // positions then velocities, float4 so one boid is one read
   extern __shared__ float4 tile[];
   float4 *tilePos = tile;
   float4 *tileVel = tile + blockDim.x;
   __shared__ int blockMin[3], blockMax[3], rowStart, rowEnd;
 
   int index = threadIdx.x + (blockIdx.x * blockDim.x);
-  // threads past N have no boid, but they still help to load the tiles
+  // threads past N still help to load the tiles
   bool active = index < N;
   glm::vec3 selfPos(0.0f);
   glm::ivec3 minCell, maxCell;
@@ -581,7 +569,7 @@ __global__ void kernUpdateVelNeighborSearchShared(
     findNeighborCells(selfPos, gridMin, inverseCellWidth, gridResolution, minCell, maxCell);
   }
 
-  // box of cells that covers the neighbor cells of all boids in the block
+  // cells needed by the whole block
   if (threadIdx.x == 0) {
     for (int k = 0; k < 3; k++) {
       blockMin[k] = INT_MAX;
@@ -600,13 +588,13 @@ __global__ void kernUpdateVelNeighborSearchShared(
   RuleSums sums;
   for (int z = blockMin[2]; z <= blockMax[2]; z++) {
     for (int y = blockMin[1]; y <= blockMax[1]; y++) {
-      // the boids this thread needs from this row
+      // boids this thread needs in this row
       int myStart = INT_MAX, myEnd = -1;
       if (active && y >= minCell.y && y <= maxCell.y && z >= minCell.z && z <= maxCell.z) {
         myStart = gridCellStartIndices[gridIndex3Dto1D(minCell.x, y, z, gridResolution)];
         myEnd = gridCellEndIndices[gridIndex3Dto1D(maxCell.x, y, z, gridResolution)];
       }
-      // the part of the row that any thread of the block needs
+      // boids the block needs in this row
       if (threadIdx.x == 0) {
         rowStart = INT_MAX;
         rowEnd = -1;
@@ -619,8 +607,7 @@ __global__ void kernUpdateVelNeighborSearchShared(
       __syncthreads();
       int start = rowStart, end = rowEnd;
       if (start >= end) {
-        // nobody needs this row. Still sync, so thread 0 doesn't reset rowStart
-        // for the next row while other threads are reading it.
+        // nobody needs this row, still sync before rowStart is reset
         __syncthreads();
         continue;
       }
@@ -667,9 +654,8 @@ void Boids::stepSimulationNaive(float dt) {
   std::swap(dev_vel1, dev_vel2);
 }
 
-// Label the boids with their cells, sort them by cell and find where each
-// cell starts and ends in the sorted array. With fillEmptyCells, an empty cell
-// gets start = end = the place where its boids would be, instead of -1.
+// label boids with cells, sort by cell, find cell start/end
+// fillEmptyCells: empty cells get start = end instead of -1
 void buildUniformGrid(bool fillEmptyCells = false) {
   dim3 fullBlocksPerGrid((numObjects + blockSize - 1) / blockSize);
   dim3 cellBlocksPerGrid((gridCellCount + blockSize - 1) / blockSize);
@@ -682,7 +668,7 @@ void buildUniformGrid(bool fillEmptyCells = false) {
     dev_thrust_particleArrayIndices);
 
   if (fillEmptyCells) {
-    // binary search every cell index in the sorted cell indices
+    // binary search for every cell
     thrust::counting_iterator<int> cells(0);
     thrust::lower_bound(dev_thrust_particleGridIndices, dev_thrust_particleGridIndices + numObjects,
       cells, cells + gridCellCount, thrust::device_ptr<int>(dev_gridCellStartIndices));
@@ -750,7 +736,7 @@ void Boids::stepSimulationCoherentGrid(float dt) {
   checkCUDAErrorWithLine("kernReshuffle failed!");
 
   // - Perform velocity updates using neighbor search
-  // sorted velocities are in vel2 now, so the new velocities go into vel1
+  // sorted vel is in vel2, new vel goes to vel1
   kernUpdateVelNeighborSearchCoherent<<<fullBlocksPerGrid, blockSize>>>(numObjects, gridSideCount,
     gridMinimum, gridInverseCellWidth, gridCellWidth,
     dev_gridCellStartIndices, dev_gridCellEndIndices,
@@ -762,12 +748,11 @@ void Boids::stepSimulationCoherentGrid(float dt) {
   checkCUDAErrorWithLine("kernUpdatePos failed!");
 
   // - Ping-pong buffers as needed. THIS MAY BE DIFFERENT FROM BEFORE.
-  // vel1 already has the new velocities, only the positions need to swap.
-  // The boids just stay in the sorted order for the next step.
+  // vel1 already has the new vel, only swap pos (boids stay sorted)
   std::swap(dev_pos, dev_pos2);
 }
 
-// Same as the coherent grid, except for the cell ranges and the velocity kernel
+// same as coherent, with filled cell ranges and the shared memory kernel
 void Boids::stepSimulationSharedGrid(float dt) {
   buildUniformGrid(true);
 
@@ -776,7 +761,7 @@ void Boids::stepSimulationSharedGrid(float dt) {
     dev_pos, dev_vel1, dev_pos2, dev_vel2);
   checkCUDAErrorWithLine("kernReshuffle failed!");
 
-  // shared memory for blockSize positions and blockSize velocities
+  // positions and velocities of one tile
   int sharedBytes = 2 * blockSize * sizeof(float4);
   kernUpdateVelNeighborSearchShared<<<fullBlocksPerGrid, blockSize, sharedBytes>>>(numObjects,
     gridSideCount, gridMinimum, gridInverseCellWidth,

@@ -30,11 +30,9 @@
 int N_FOR_VIS = 5000;
 const float DT = 0.2f;
 
-// These can also be changed from the command line, for example
-//   cis5650_boids.exe -n 20000 -mode scattered -block 256 -cell 1 -novis -time 10
-// "-time T" prints the average fps over T seconds and then exits.
+// command line options, e.g. -n 20000 -mode shared -block 256 -cell 1 -novis -time 10
 bool visualize = VISUALIZE;
-// 0 naive, 1 scattered, 2 coherent, 3 coherent with shared memory ("-mode shared")
+// 0 naive, 1 scattered, 2 coherent, 3 shared
 int simMode = UNIFORM_GRID ? (COHERENT_GRID ? 2 : 1) : 0;
 int cudaBlockSize = 128;
 float cellScale = 2.0f;
@@ -130,7 +128,7 @@ bool init(int argc, char **argv) {
     return false;
   }
   glfwMakeContextCurrent(window);
-  // turn off v-sync so the fps is not capped at the monitor refresh rate
+  // turn off v-sync
   glfwSwapInterval(0);
   glfwSetKeyCallback(window, keyCallback);
   glfwSetCursorPosCallback(window, mousePositionCallback);
@@ -265,7 +263,7 @@ void initShaders(GLuint * program) {
     Boids::unitTest(); // LOOK-1.2 We run some basic example code to make sure
                        // your CUDA development setup is ready to go.
 
-    // average fps over the whole run, skipping the first second as warm up
+    // average fps, skip the first second
     double avgStart = glfwGetTime() + 1.0;
     int avgFrames = 0;
     double avgFps = 0;
